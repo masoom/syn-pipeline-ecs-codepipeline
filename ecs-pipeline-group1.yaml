@@ -1,0 +1,359 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Pipeline to build and deploy data syn POC on ECS Fargate
+
+Parameters:
+
+  RepoName:
+    Type: String
+    Default: 'data-syn-poc-group1'
+    Description: Name of the codecommit repo
+
+  CodeBuildEnvironment:
+    Type: String
+    Default: "aws/codebuild/standard:2.0"
+    Description: Docker image to use for CodeBuild container - Use http://amzn.to/2mjCI91 for reference
+
+  StackName:
+    Type: String
+    Default: "data-syn-poc-gpu-group-1"
+    Description: Name of the Cloudformation stack to create/update
+
+  CodeRepositoryName:
+    Type: String
+    Default: 'data-syn-poc-group1'
+    Description: Name of the CodeCommit Repo
+
+  POCRepoName:
+    Description: ECR repo that contains the Docker Image for the Task
+    Default: 'data-syn-poc-ecr-group-1'
+    Type: String
+
+  SubnetIdAZ1:
+    Description: SubnetId of availability zone 1
+    Default: '/customer/landing-zone/vpc/private-subnet-1-id'
+    Type: 'AWS::SSM::Parameter::Value<String>'
+
+  SubnetIdAZ2:
+    Description: SubnetId of availability zone 2
+    Default: '/customer/landing-zone/vpc/private-subnet-2-id'
+    Type: 'AWS::SSM::Parameter::Value<String>'
+
+  SubnetIdAZ3:
+    Description: SubnetId of availability zone 3
+    Default: '/customer/landing-zone/vpc/private-subnet-3-id'
+    Type: 'AWS::SSM::Parameter::Value<String>'
+
+  VpcId:
+    Description: Id of the VPC
+    Default: /customer/landing-zone/vpc/vpc-id
+    Type: 'AWS::SSM::Parameter::Value<String>'
+
+  AppPipeline:
+    Description: CodePipeline Name
+    Default: "data-syn-poc-gpu-group-1"
+    Type: String
+
+Resources:
+
+  #  DataRepo:
+  #    Type: AWS::ECR::Repository
+  #    Properties:
+  #      LifecyclePolicy:
+  #        LifecyclePolicyText: |
+  #          {
+  #            "rules": [
+  #            {
+  #              "rulePriority": 1,
+  #              "description": "Only keep 5 images",
+  #              "selection": {
+  #                "tagStatus": "any",
+  #                "countType": "imageCountMoreThan",
+  #                "countNumber": 5
+  #              },
+  #              "action": { "type": "expire" }
+  #            }]
+  #          }
+  #      RepositoryName: !Ref POCRepoName
+
+  BuildArtifactsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+
+  BuildArtifactsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref BuildArtifactsBucket
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Sid: EnforceHTTPS
+            Action: 's3:*'
+            Effect: Deny
+            Principal: '*'
+            Resource: !Sub 'arn:aws:s3:::${BuildArtifactsBucket}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+
+  CodeBuildServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: data-syn-poc-gpu-group-1-codebuild-service-role
+      Path: '/managed/'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryPowerUser'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          -
+            Action: 'sts:AssumeRole'
+            Effect: Allow
+            Principal:
+              Service:
+                - codebuild.amazonaws.com
+      Policies:
+        -
+          PolicyName: CodeBuildAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              -
+                Sid: "CodeBuildToCWL"
+                Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource:
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/data-syn-poc-gpu-group-1'
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/data-syn-poc-gpu-group-1:*'
+              -
+                Sid: "CodeBuildToS3ArtifactRepo"
+                Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                  - 's3:GetObjectVersion'
+                  - 's3:PutObject'
+                Resource: !Sub 'arn:aws:s3:::${BuildArtifactsBucket}/*'
+              - Sid: CodePipelineSecretManagerAccess
+                Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource:
+                  - !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:data-syn-poc-group-1/*'
+              - Sid: CodePipelineSSMParameterAccess
+                Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                Resource:
+                  - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/data-syn-poc-gpu/group-1/*'
+              - Sid: AllowDescribeSecurityGroups
+                Effect: Allow
+                Action:
+                  - ec2:CreateNetworkInterface
+                  - ec2:DescribeDhcpOptions
+                  - ec2:DescribeNetworkInterfaces
+                  - ec2:DeleteNetworkInterface
+                  - ec2:DescribeSubnets
+                  - ec2:DescribeSecurityGroups
+                  - ec2:DescribeVpcs
+                  - ec2:CreateNetworkInterfacePermission
+                Resource: '*'
+              - Sid: AllowECS
+                Effect: Allow
+                Action:
+                  - ecs:DescribeTaskDefinition
+                  - ecs:DescribeTasks
+                  - ecs:RegisterTaskDefinition
+                  - ecs:RunTask
+                  - ecs:ListTaskDefinitions
+                  - ecs:ListTasks
+                  - ecs:StartTask
+                  - ecs:StopTask
+                Resource: '*'
+              - Action: 'iam:PassRole'
+                Effect: Allow
+                Resource: '*'
+
+  PipelineExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: data-syn-poc-gpu-group-1-pipeline-exec-role
+      Path: '/managed/'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/PowerUserAccess
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Action: 'sts:AssumeRole'
+            Effect: Allow
+            Principal:
+              Service:
+                - codepipeline.amazonaws.com
+                - cloudformation.amazonaws.com
+      Policies:
+        - PolicyName: CodePipelinePassRoleAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Action: 'iam:PassRole'
+                Effect: Allow
+                Resource: '*'
+        - PolicyName: CodePipelineS3ArtifactAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Action:
+                  - 's3:GetObject'
+                  - 's3:GetObjectVersion'
+                  - 's3:GetBucketVersioning'
+                  - 's3:PutObject'
+                Effect: Allow
+                Resource:
+                  - !Sub 'arn:aws:s3:::${BuildArtifactsBucket}'
+                  - !Sub 'arn:aws:s3:::${BuildArtifactsBucket}/*'
+        - PolicyName: CodePipelineGitRepoAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Action:
+                  - 'codecommit:GetBranch'
+                  - 'codecommit:GetCommit'
+                  - 'codecommit:UploadArchive'
+                  - 'codecommit:GetUploadArchiveStatus'
+                  - 'codecommit:CancelUploadArchive'
+                Effect: Allow
+                Resource: !Sub 'arn:aws:codecommit:${AWS::Region}:${AWS::AccountId}:${CodeRepositoryName}'
+
+        - PolicyName: CodePipelineBuildAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Action:
+                  - 'codebuild:StartBuild'
+                  - 'codebuild:StopBuild'
+                  - 'codebuild:BatchGetBuilds'
+                Effect: Allow
+                Resource: !GetAtt CodeBuildProject.Arn
+
+  ECRSourceCloudWatchEventRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - events.amazonaws.com
+            Action: sts:AssumeRole
+      Path: /
+      RoleName: data-syn-poc-gpu-group-1-role-ecr-source-cw-event-role
+      Policies:
+        - PolicyName: cwe-pipeline-execution
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action: codepipeline:StartPipelineExecution
+                Resource: !Sub arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:${AppPipeline}
+
+
+  ECRSourceCloudWatchEventRule:
+    Type: 'AWS::Events::Rule'
+    Properties:
+      EventPattern:
+        detail:
+          action-type: [PUSH]
+          image-tag: [latest]
+          repository-name: [!Ref POCRepoName]
+          # repository-name: [cwe-test]
+          result: [SUCCESS]
+        detail-type: [ECR Image Action]
+        source: [aws.ecr]
+      Targets:
+        - Arn: !Sub arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:${AppPipeline}
+          # arn:aws:codepipeline:eu-west-1:456686683148:data-syn-poc-gpu-group-1
+          RoleArn: !GetAtt
+            - ECRSourceCloudWatchEventRole
+            - Arn
+          Id: codepipeline-data-syn-pipeline
+
+  CodeBuildSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for codebuild
+      GroupName: data-syn-poc-gpu-group-1-codebuild-sg
+      SecurityGroupEgress:
+        - Description: outgoing https
+          CidrIp: 0.0.0.0/0
+          IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+      VpcId: !Ref VpcId
+
+  CodeBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: 'data-syn-poc-gpu-group-1'
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: !Sub '${CodeBuildEnvironment}'
+        PrivilegedMode: true
+      ServiceRole: !GetAtt CodeBuildServiceRole.Arn
+      Source:
+        Type: CODEPIPELINE
+      TimeoutInMinutes: 60
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref CodeBuildSecurityGroup
+        Subnets:
+          - !Ref SubnetIdAZ1
+          - !Ref SubnetIdAZ2
+          - !Ref SubnetIdAZ3
+        VpcId: !Ref VpcId
+
+  Pipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      ArtifactStore:
+        Location: !Ref BuildArtifactsBucket
+        Type: S3
+      Name: 'data-syn-poc-gpu-group-1'
+      RoleArn: !GetAtt PipelineExecutionRole.Arn
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: CodeCommitRepo
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: CodeCommit
+                Version: "1"
+              Configuration:
+                RepositoryName: !Ref RepoName
+                BranchName: master
+              OutputArtifacts:
+                - Name: SourceZip
+              RunOrder: 1
+        - Name: Build
+          Actions:
+            - Name: CodeBuild
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: "1"
+              Configuration:
+                ProjectName: !Ref CodeBuildProject
+              InputArtifacts:
+                - Name: SourceZip
+              OutputArtifacts:
+                - Name: BuiltZip

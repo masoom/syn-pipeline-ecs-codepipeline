@@ -1,0 +1,463 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Amazon ECS Cluster with EC2 Launch Type for data-syn-poc-gpu-group-1
+
+Parameters:
+  AmiId:
+    Type: AWS::EC2::Image::Id
+    Description: Specifies the AMI ID for your container instances.
+    Default: 'ami-018a0adf2c2ca04fd'
+
+  EcsInstanceType:
+    Type: String
+    Description: >
+      Specifies the EC2 instance type for your container instances.
+      Defaults to m4.large
+    Default: 'p2.8xlarge'
+    ConstraintDescription: must be a valid EC2 instance type.
+
+  ClusterStackName:
+    Type: String
+    Description: Name for the ECS Cluster stack (used to separate multiple setups)
+
+  VpcId:
+    Description: Gets the customer VPC ID from SSM Parameter store
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::VPC::Id>'
+    Default: '/customer/landing-zone/vpc/vpc-id'
+
+  PrivateSubnetAZ1:
+    Description: PrivateSubnet 1
+    Default: '/customer/landing-zone/vpc/private-subnet-1-id'
+    Type: 'AWS::SSM::Parameter::Value<String>'
+
+  PrivateSubnetAZ2:
+    Description: PrivateSubnet 2
+    Default: '/customer/landing-zone/vpc/private-subnet-2-id'
+    Type: 'AWS::SSM::Parameter::Value<String>'
+
+  PrivateSubnetAZ3:
+    Description: PrivateSubnet 3
+    Default: '/customer/landing-zone/vpc/private-subnet-3-id'
+    Type: 'AWS::SSM::Parameter::Value<String>'
+
+  DataSynPOCImageName:
+    Description: Docker Image Name for data-syn-poc
+    Default: '456686683148.dkr.ecr.eu-west-1.amazonaws.com/data-syn-poc-ecr-group-1:latest'
+    Type: String
+
+Resources:
+
+  DataSynPOCClusterSSM:
+    Type: "AWS::SSM::Parameter"
+    Properties:
+      Name: '/data-syn-poc-gpu/group-1/cluster-name'
+      Type: String
+      Value: !Ref 'ClusterStackName'
+      Description: "Cluster name of data-syn-poc"
+
+#  DataSynPOCServiceSSM:
+#    Type: "AWS::SSM::Parameter"
+#    Properties:
+#      Name: '/data-syn-poc-gpu/group-1/service-name'
+#      Type: String
+#      Value: !Sub '${ClusterStackName}-service'
+#      Description: "ECS Service Name of data-syn-poc-gpu"
+
+  DataSynPOCTaskNameSSM:
+    Type: "AWS::SSM::Parameter"
+    Properties:
+      Name: '/data-syn-poc-gpu/group-1/task-name'
+      Type: String
+      Value: !Sub '${ClusterStackName}-task'
+      Description: "Task name of data-syn-poc-gpu"
+
+  CloudwatchLogsGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Join ['-', [ECSLogGroup, !Ref 'AWS::StackName']]
+      RetentionInDays: 14
+
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub ${AWS::StackName}
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}' }
+
+  DataSynPOCTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub ${ClusterStackName}-task
+      RequiresCompatibilities:
+        - "EC2"
+      NetworkMode: awsvpc
+      ContainerDefinitions:
+        - Name: data-syn-poc-gpu
+          Image: !Ref DataSynPOCImageName
+          Memory: '420712'
+          Environment:
+            - Name: 'data_bucket'
+              Value: 'syn-data-team-bucket'
+            - Name: 'og_file_key'
+              Value: 'final_original.pkl'
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref 'CloudwatchLogsGroup'
+              awslogs-region: !Ref 'AWS::Region'
+              awslogs-stream-prefix: !Ref 'ClusterStackName'
+      TaskRoleArn: !Ref TaskExecutionRole
+      ExecutionRoleArn: !Ref TaskExecutionRole
+
+  ContainerInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: 'sts:AssumeRole'
+          - Effect: Allow
+            Principal:
+              Service: spotfleet.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Description: !Sub Amazon ECS Container Instance Role for ${Cluster}
+      PermissionsBoundary: !Sub arn:aws:iam::${AWS::AccountId}:policy/customer-permissions-boundary
+      RoleName: !Sub ${AWS::StackName}-container-instance-role
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceforEC2Role
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2SpotFleetTaggingRole
+      Policies:
+        - PolicyName: AgentManagementPolicy
+          PolicyDocument:
+            Statement:
+              - Sid: AllowGlobalActions
+                Effect: Allow
+                Action:
+                  - ecs:DiscoverPollEndpoint
+                Resource: '*'
+
+              - Sid: AllowClusterScopedActions
+                Effect: Allow
+                Action:
+                  - ecs:DeregisterContainerInstance
+                  - ecs:RegisterContainerInstance
+                  - ecs:Submit*
+                Resource:
+                  - !GetAtt Cluster.Arn
+
+              - Sid: AllowContainerInstanceScopedActions
+                Effect: Allow
+                Action:
+                  - ecs:Poll
+                  - ecs:StartTelemetrySession
+                Resource:
+                  - !Sub arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:container-instance/${Cluster}/*
+
+              - Sid: AllowEcrActions
+                Effect: Allow
+                Action:
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                  - 'ecr:DescribeRepositories'
+                  - 'ecr:GetAuthorizationToken'
+                  - 'ecr:BatchGetImage'
+                  - 'ecr:GetDownloadUrlForLayer'
+                Resource:
+                  - '*'
+
+  ContainerInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub ${AWS::StackName}-container-instance-profile
+      Path: /
+      Roles:
+        - !Ref ContainerInstanceRole
+
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      PermissionsBoundary: !Sub arn:aws:iam::${AWS::AccountId}:policy/customer-permissions-boundary
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Description: !Sub Amazon ECS Task Execution Role for ${Cluster}
+      RoleName: !Sub ${AWS::StackName}-task-execution-role
+      Path: /
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy'
+      Policies:
+        - PolicyName: EcsS3ReadOnlyAccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                  - s3:ListBucketMultipartUploads
+                  - s3:ListBucketVersions
+                Resource: arn:aws:s3:::syn-data-team-bucket
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:PutObjectAcl
+                  - s3:PutObjectTagging
+                  - s3:AbortMultipartUpload
+                  - s3:ListMultipartUploadParts
+                  - s3:CompleteMultipartUpload
+                Resource: arn:aws:s3:::syn-data-team-bucket/*
+        - PolicyName: EcsEventRunTaskPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource: "*"
+              - Effect: Allow
+                Action: ecs:RunTask
+                Resource: !Sub 'arn:aws:ecs:eu-west-1:456686683148:task-definition/${ClusterStackName}-task'
+        - PolicyName: EcsTasksPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "ecs-tasks:*"
+                  - "elasticloadbalancing:*"
+                  - "ecr:*"
+                  - "cloudwatch:*"
+                Resource: "*"
+        - PolicyName: DataSynkmsPolicyECS
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: VisualEditor0
+                Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:TagResource
+                  - kms:UntagResource
+                  - kms:ListKeyPolicies
+                  - kms:Encrypt
+                  - kms:GetKeyPolicy
+                  - kms:CreateAlias
+                  - kms:DescribeKey
+                Resource: arn:aws:kms:eu-west-1:456686683148:key/789ec88e-5776-4803-9f8f-378be57c6132
+              - Sid: VisualEditor1
+                Effect: Allow
+                Action:
+                  - kms:ListKeys
+                  - kms:ListAliases
+                Resource: "*"
+        - PolicyName: ecs-attach-network-interface
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  # Rules which allow ECS to attach network interfaces to instances
+                  # on your behalf in order for awsvpc networking mode to work right
+                  - 'ec2:AttachNetworkInterface'
+                  - 'ec2:CreateNetworkInterface'
+                  - 'ec2:CreateNetworkInterfacePermission'
+                  - 'ec2:DeleteNetworkInterface'
+                  - 'ec2:DeleteNetworkInterfacePermission'
+                  - 'ec2:Describe*'
+                  - 'ec2:DetachNetworkInterface'
+                Resource: '*'
+
+  AgentExecutionPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: AgentExecutionPolicy
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowImagePulls
+            Effect: Allow
+            Action:
+              - ecr:GetAuthorizationToken
+              - ecr:BatchCheckLayerAvailability
+              - ecr:BatchGetImage
+              - ecr:GetDownloadUrlForLayer
+            Resource: '*'
+
+          - Sid: AllowLogging
+            Effect: Allow
+            Action:
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Resource: '*'
+      Roles:
+        - !Ref ContainerInstanceRole
+        - !Ref TaskExecutionRole
+
+  ContainerInstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub ${AWS::StackName}-sg
+      GroupDescription: !Sub Security group for ${Cluster} container instances
+      VpcId: !Ref VpcId
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-sg' }
+
+  NodeLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub ${AWS::StackName}-template
+      LaunchTemplateData:
+        InstanceType: !Ref EcsInstanceType
+        InstanceMarketOptions:
+          MarketType: spot
+          SpotOptions:
+            SpotInstanceType: persistent
+            InstanceInterruptionBehavior: stop
+        IamInstanceProfile:
+          Arn: !GetAtt ContainerInstanceProfile.Arn
+        ImageId: !Ref AmiId
+#        NetworkInterfaces:
+#          - SubnetId: !Ref PrivateSubnetAZ1
+#            DeviceIndex: 0
+#            AssociatePublicIpAddress: false
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - { Key: Name, Value: !Sub '${AWS::StackName}-node' }
+          - ResourceType: volume
+            Tags:
+              - { Key: Name, Value: !Sub '${AWS::StackName}-volume' }
+        UserData:
+          Fn::Base64:
+            !Sub |
+            #!/bin/bash
+            set -o xtrace
+
+            # Setup SSM for remote management
+            yum install -y amazon-ssm-agent
+            systemctl start amazon-ssm-agent
+
+            # Configure ECS Agent
+            echo ECS_CLUSTER=${Cluster} >> /etc/ecs/ecs.config
+
+            # Block container access to EC2 Instance Metadata
+            yum install -y iptables-services
+            iptables --insert FORWARD 1 --in-interface docker+ --destination 169.254.169.254/32 --jump DROP
+            iptables-save | tee /etc/sysconfig/iptables
+            systemctl enable --now iptables
+
+            # Signal success to CloudFormation
+            yum install -y aws-cfn-bootstrap
+            /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource PersistentSpotInstance --region ${AWS::Region}
+
+
+  PersistentSpotInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref NodeLaunchTemplate
+        Version: !GetAtt NodeLaunchTemplate.LatestVersionNumber
+      SubnetId: !Ref PrivateSubnetAZ1
+      SecurityGroupIds:
+        - !Ref ContainerInstanceSecurityGroup
+      Tags:
+        - Key: Name
+          Value: data-syn-poc-gpu
+
+# Enable this block if you use EC2SpotFleet
+#  spotFleet:
+#    Type: AWS::EC2::SpotFleet
+#    Properties:
+#      SpotFleetRequestConfigData:
+#        AllocationStrategy: diversified
+#        IamFleetRole: !GetAtt ContainerInstanceRole.Arn
+#        TargetCapacity: 1
+#        LaunchSpecifications:
+#          - IamInstanceProfile:
+#              Arn: !GetAtt ContainerInstanceProfile.Arn
+#            ImageId: !Ref AmiId
+#            InstanceType: !Ref EcsInstanceType
+#            Monitoring:
+#              Enabled: true
+#            SecurityGroups:
+#              - GroupId: !Ref ContainerInstanceSecurityGroup
+#            SubnetId:
+#              !Ref PrivateSubnetAZ1
+#            UserData:
+#              Fn::Base64:
+#                !Sub |
+#                #!/bin/bash
+#                set -o xtrace
+#
+#                # Setup SSM for remote management
+#                yum install -y amazon-ssm-agent
+#                systemctl start amazon-ssm-agent
+#
+#                # Configure ECS Agent
+#                echo ECS_CLUSTER=${Cluster} >> /etc/ecs/ecs.config
+
+#        LaunchTemplateConfigs:
+#          - LaunchTemplateSpecification:
+#              LaunchTemplateId: !Ref NodeLaunchTemplate
+#              Version: !GetAtt NodeLaunchTemplate.LatestVersionNumber
+#            Overrides:
+#            - InstanceType: !Ref EcsInstanceType
+#              SubnetId: !Ref PrivateSubnetAZ1
+
+
+#  Enable this if you are using ECSAutoScalingGroup:
+#    Type: AWS::AutoScaling::AutoScalingGroup
+#    CreationPolicy:
+#      ResourceSignal:
+#        Timeout: PT15M
+#    UpdatePolicy:
+#      AutoScalingRollingUpdate:
+#        MinInstancesInService: 1
+#        PauseTime: PT15M
+#        WaitOnResourceSignals: True
+#    Properties:
+#      LaunchTemplate:
+#        LaunchTemplateId: !Ref NodeLaunchTemplate
+#        Version: !GetAtt NodeLaunchTemplate.LatestVersionNumber
+##      MixedInstancesPolicy:
+##        InstancesDistribution:
+##          OnDemandPercentageAboveBaseCapacity: 0
+##        LaunchTemplate:
+##          LaunchTemplateSpecification:
+##            LaunchTemplateId: !Ref NodeLaunchTemplate
+##            Version: !GetAtt NodeLaunchTemplate.LatestVersionNumber
+##          Overrides:
+##            - InstanceType: !Ref EcsInstanceType
+#      DesiredCapacity: '1'
+#      MinSize: '0'
+#      MaxSize: '10'
+#      VPCZoneIdentifier:
+#        - !Ref PrivateSubnetAZ1
+#        - !Ref PrivateSubnetAZ2
+#        - !Ref PrivateSubnetAZ3
+#      Tags:
+#        - { Key: Name, Value: !Sub '${AWS::StackName}-asg', PropagateAtLaunch: false }
+
+Outputs:
+  TaskExecutionRoleArn:
+    Description: ARN of the ECS Task Execution Role (for Fargate)
+    Value: !GetAtt TaskExecutionRole.Arn
+    Export:
+      Name: !Sub ecs-${ClusterStackName}-TaskExecutionRoleArn
+
+  ClusterId:
+    Description: The name / id of the ECS cluster
+    Value: !Ref Cluster
+    Export:
+      Name: !Sub ecs-${ClusterStackName}-ClusterId
+
+  ContainerInstanceSecurityGroupId:
+    Description: Security group ID of the ECS cluster container instances
+    Value: !Ref ContainerInstanceSecurityGroup
+    Export:
+      Name: !Sub ecs-${ClusterStackName}-SecurityGroupId
